@@ -571,33 +571,6 @@ class Course:
                 for item in MediaType.list_dirs():
                     os.makedirs(self.path(item), exist_ok=True)
 
-    def download_videos(self, s: SessionWithKey) -> List[PreMediaContainer]:
-        if config.download_videos is False:
-            return []
-
-        url = "https://isis.tu-berlin.de/lib/ajax/service.php"
-        # Thank you isia-tub for this data <3
-        video_data = [{
-            "methodname": "mod_videoservice_get_videos",
-            "args": {"courseid": self.course_id}
-        }]
-
-        videos_res = s.get_(url, params={"sesskey": s.key}, json=video_data)
-
-        if videos_res is None or not videos_res.ok:
-            return []
-
-        videos_json = videos_res.json()[0]
-
-        if videos_json["error"]:
-            return []
-
-        videos_json = videos_json["data"]["videos"]
-        video_urls = [item["url"] for item in videos_json]
-        video_names = [item["title"].strip() + item["fileext"] for item in videos_json]
-
-        return [PreMediaContainer(url, self, MediaType.video, name) for url, name in zip(video_urls, video_names)]
-
     def download_documents(self, helper: RequestHelper) -> List[PreMediaContainer]:
         content = helper.post_REST("core_course_get_contents", {"courseid": self.course_id})
         if content is None or isinstance(content, dict) and "exception" in content:
@@ -704,6 +677,7 @@ class RequestHelper:
     course_id_mapping: Dict[int, Course] = {}
     _instance: Optional[RequestHelper] = None
     _instance_init: bool = False
+    _lock = Lock()
 
     def __init__(self, user: User, status: Optional[RequestHelperStatus] = None):
         if self._instance_init:
@@ -786,21 +760,22 @@ class RequestHelper:
         return response.json()
 
     def download_content(self, status: Optional[RequestHelperStatus] = None) -> Dict[MediaType, List[MediaContainer]]:
-        exception_lock = Lock()
-
         if status is not None:
             status.set_total(len(self.courses))
 
         if enable_multithread:
             with ThreadPoolExecutor(discover_num_threads) as ex:
-                _mod_assign = ex.map(self._download_mod_assign)
-                _document_containers = ex.map(self._download_documents, self.courses, repeat(exception_lock))
-                _video_containers = ex.map(self._download_videos, self.courses, repeat(exception_lock), repeat(status))
+                # Note the use of .map() instead of .submit(). This is done so in both cases the variable can be of type `Iterable`.
+                # If done with .submit() one would have to wrap the function call into a `Future` which is too cumbersome.
+                _mod_assign = ex.map(self._download_mod_assign, [0])
+                _video_containers = ex.map(self._download_videos, [0])
+
+                _document_containers = ex.map(self._download_documents, self.courses, repeat(status))
 
         else:
-            _mod_assign = iter([self._download_mod_assign()])
-            _document_containers = iter([self._download_documents(course, exception_lock) for course in self.courses])
-            _video_containers = iter([self._download_videos(course, exception_lock, status) for course in self.courses])
+            _mod_assign = iter([self._download_mod_assign(0)])
+            _video_containers = iter([self._download_videos(0)])
+            _document_containers = iter([self._download_documents(course, status) for course in self.courses])
 
         pre_containers = [item for row in chain(_document_containers, _video_containers, _mod_assign) for item in row]
         pre_containers = list({f"{item.course} {item.url}": item for item in pre_containers}.values())
@@ -832,42 +807,77 @@ class RequestHelper:
 
         return {typ: sorted(item, key=lambda x: x.time, reverse=True) for typ, item in mapping.items()}
 
-    def _download_mod_assign(self) -> List[PreMediaContainer]:
-        all_content = []
-        _assignments = self.post_REST("mod_assign_get_assignments", use_timeout=False)
-        if _assignments is None:
-            return []
+    def _download_mod_assign(self, _: Any) -> List[PreMediaContainer]:
+        try:
+            all_content = []
+            _assignments = self.post_REST("mod_assign_get_assignments", use_timeout=False)
+            if _assignments is None:
+                return []
 
-        assignments = cast(Dict[str, Any], _assignments)
+            assignments = cast(Dict[str, Any], _assignments)
 
-        allowed_ids = {item.course_id for item in self.courses}
-        for _course in assignments["courses"]:
-            if _course["id"] in allowed_ids:
-                for assignment in _course["assignments"]:
-                    if "introattachments" not in assignment:
-                        continue
+            allowed_ids = {item.course_id for item in self.courses}
+            for _course in assignments["courses"]:
+                if _course["id"] in allowed_ids:
+                    for assignment in _course["assignments"]:
+                        if "introattachments" not in assignment:
+                            continue
 
-                    for file in assignment["introattachments"]:
-                        file["filepath"] = assignment["name"]
-                        all_content.append(PreMediaContainer(file["fileurl"], RequestHelper.course_id_mapping[_course["id"]], MediaType.document,
-                                                             file["filename"], file["filepath"], file["filesize"], file["timemodified"]))
+                        for file in assignment["introattachments"]:
+                            file["filepath"] = assignment["name"]
+                            all_content.append(PreMediaContainer(
+                                file["fileurl"], RequestHelper.course_id_mapping[_course["id"]], MediaType.document,
+                                file["filename"], file["filepath"], file["filesize"], file["timemodified"])
+                            )
 
-        return all_content
+            return all_content
 
-    def _download_documents(self, course: Course, exception_lock: Lock) -> List[PreMediaContainer]:
+        except Exception as ex:
+            with self._lock:
+                generate_error_message(ex)
+
+    def _download_videos(self, _: Any) -> List[PreMediaContainer]:
+        try:
+            if config.download_videos is False:
+                return []
+
+            url = "https://isis.tu-berlin.de/lib/ajax/service.php"
+            # Thank you isia-tub for discovering this service.
+            video_data = [{
+                "methodname": "mod_videoservice_get_videos",
+                "args": {"courseid": course.course_id},
+                "index": i
+            } for i, course in enumerate(self.courses)]
+
+            videos_res = self.session.get_(url, params={"sesskey": self.session.key}, json=video_data)
+
+            if videos_res is None or not videos_res.ok:
+                return []
+
+            res = []
+            for course, video in zip(self.courses, videos_res.json()):
+                if video["error"]:
+                    continue
+                assert course.course_id == video["data"]["courseid"]
+
+                videos_json = video["data"]["videos"]
+                video_urls = [item["url"] for item in videos_json]
+                video_names = [item["title"].strip() + item["fileext"] for item in videos_json]
+
+                res.extend([PreMediaContainer(url, course, MediaType.video, name) for url, name in zip(video_urls, video_names)])
+
+            return res
+
+        except Exception as ex:
+            with self._lock:
+                generate_error_message(ex)
+
+    def _download_documents(self, course: Course, status: Optional[RequestHelperStatus] = None) -> List[PreMediaContainer]:
         try:
             return course.download_documents(self)
 
         except Exception as ex:
-            with exception_lock:
-                generate_error_message(ex)
-
-    def _download_videos(self, course: Course, exception_lock: Lock, status: Optional[RequestHelperStatus] = None) -> List[PreMediaContainer]:
-        try:
-            return course.download_videos(self.session)
-
-        except Exception as ex:
-            with exception_lock:
+            with self._lock:
                 generate_error_message(ex)
 
         finally:
